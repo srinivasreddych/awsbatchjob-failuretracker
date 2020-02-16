@@ -1,0 +1,187 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: AWS Step Functions sample project for running an AWS Batch job and monitoring until it completes
+Parameters:
+    NameOfSolution:
+      Description: An environment name that will be prefixed to resource names
+      Type: String
+      Default: "test-step"
+Resources:
+  EventRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+        Description: EventRule
+        EventPattern:
+            source:
+                - aws.batch
+            detail-type:
+                - AWS API Call via CloudTrail
+            detail:
+                eventName:
+                - SubmitJob
+        State: ENABLED
+        Targets:
+        - Arn: !Ref JobStatusPollerStateMachine
+          RoleArn: !GetAtt EventRulePermission.Arn
+          Id: TargetFunctionV1
+  
+  EventRulePermission:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+                Service: events.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: EventInvokingStepFunctionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+            - Effect: Allow
+              Action: "states:StartExecution"
+              Resource: !Ref JobStatusPollerStateMachine
+
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: BatchExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "batch:SubmitJob"
+                  - "batch:DescribeJobs"
+                Resource: "*"
+    
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${NameOfSolution}
+      RetentionInDays: 30
+
+  CheckJobFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: "index.lambda_handler"
+      FunctionName: !Sub '${NameOfSolution}'
+      Role: !GetAtt [ LambdaExecutionRole, Arn ]
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          batch = boto3.client('batch')
+
+          def lambda_handler(event, context):
+              # Log the received event
+              print("Received event: " + json.dumps(event, indent=2))
+              # Get jobId from the event
+              jobId = event['detail']['responseElements']['jobId']
+
+              try:
+                  # Call DescribeJobs
+                  response = batch.describe_jobs(jobs=[jobId])
+                  # Log response from AWS Batch
+                  print("Response: " + json.dumps(response, indent=2))
+                  # Return the jobtatus
+                  jobStatus = response['jobs'][0]['status']
+                  return jobStatus
+              except Exception as e:
+                  print(e)
+                  message = 'Error getting Batch Job status'
+                  print(message)
+                  raise Exception(message)
+      Runtime: "python3.6"
+      Timeout: "25"
+
+  StatesExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: states.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource: "*"
+
+  JobStatusPollerStateMachine:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties:
+      DefinitionString:
+        !Sub
+          - |-
+            {
+              "Comment": "An example of the Amazon States Language that runs an AWS Batch job and monitors the job until it completes.",
+              "StartAt": "PassingPayload Job",
+              "States": {
+                "PassingPayload Job": {
+                  "Type": "Pass",
+                  "ResultPath": "$.guid",
+                  "Next": "Wait X Seconds"
+                },
+                "Wait X Seconds": {
+                  "Type": "Wait",
+                  "Seconds": 120,
+                  "Next": "Get Job Status"
+                },
+                "Get Job Status": {
+                  "Type": "Task",
+                  "Resource": "${checkJobArn}",
+                  "Next": "Job Complete?",
+                  "InputPath": "$.guid",
+                  "ResultPath": "$.status"
+                },
+                "Job Complete?": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Variable": "$.status",
+                      "StringEquals": "FAILED",
+                      "Next": "Job Failed"
+                    },
+                    {
+                      "Variable": "$.status",
+                      "StringEquals": "SUCCEEDED",
+                      "Next": "Get Final Job Status"
+                    }
+                  ],
+                  "Default": "Wait X Seconds"
+                },
+                "Job Failed": {
+                  "Type": "Fail",
+                  "Cause": "AWS Batch Job Failed",
+                  "Error": "DescribeJob returned FAILED"
+                },
+                "Get Final Job Status": {
+                  "Type": "Task",
+                  "Resource": "${checkJobArn}",
+                  "InputPath": "$.guid",
+                  "End": true
+                }
+              }
+            }
+          - {checkJobArn: !GetAtt [ CheckJobFunction, Arn ]}
+      RoleArn: !GetAtt [ StatesExecutionRole, Arn ]
